@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Social Media Engagement</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f7f7f7; }
+        #controls { background: #fff; padding: 10px; display: flex; gap: 20px; align-items: center; justify-content: center; }
+        .container { display: flex; flex-direction: row; align-items: flex-start; justify-content: center; margin: 20px; gap: 20px; }
+        svg { background: #fff; margin: 10px; }
+        .tooltip { position: absolute; padding: 6px; background: #333; color: #fff; font-size: 12px; border-radius: 4px; opacity: 0; pointer-events: none; }
+        button.active { background: #1f77b4; color: #fff; }
+        .legend-container { display: flex; flex-direction: column; align-items: flex-start; margin-top: 50px; }
+        .legend-item { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; font-size: 13px; }
+        .legend-color { width: 14px; height: 14px; }
+        .bar { cursor: pointer; }
+        .bar.inactive { opacity: 0.3; }
+        .selected { stroke: black; stroke-width: 1.5px; }
+    </style>
+</head> 
+<body>
+    <div id="controls">
+        <button id="resetFilters">Reset</button>
+        Age Group:
+        <select id="ageSelect"></select>
+        Region:
+        <select id="regionSelect"></select>
+        Sentiment:
+        <button data-sentiment="all" class="active">All</button>
+        <button data-sentiment="positive">Positive</button>
+        <button data-sentiment="negative">Negative</button>
+        <button data-sentiment="neutral">Neutral</button>
+    </div>
+
+    <div class="container">
+        <svg id="scatterplot" width="600" height="450"></svg>
+        <div id="legend" class="legend-container"></div>
+        <svg id="platformBar" width="400" height="450"></svg>
+        <svg id="genderBar" width="400" height="450"></svg>
+    </div>
+    <div class="container">
+        <svg id="histogram" width="1000" height="300"></svg>
+    </div>
+    <div class="tooltip" id="tooltip"></div>
+
+    <script>
+        var scatterSvg = d3.select("#scatterplot"),
+            histSvg = d3.select("#histogram"),
+            platformSvg = d3.select("#platformBar"),
+            genderSvg = d3.select("#genderBar"),
+            tooltip = d3.select("#tooltip"),
+            legendContainer = d3.select("#legend");
+
+        var scatterWidth = +scatterSvg.attr("width"),
+            scatterHeight = +scatterSvg.attr("height"),
+            histWidth = +histSvg.attr("width"),
+            histHeight = +histSvg.attr("height"),
+            platformWidth = +platformSvg.attr("width"),
+            platformHeight = +platformSvg.attr("height"),
+            genderWidth = +genderSvg.attr("width"),
+            genderHeight = +genderSvg.attr("height");
+
+        var colorScale = d3.scaleOrdinal(d3.schemeCategory10);
+        var selectedPlatforms = new Set();
+        var selectedGender = null;
+        var selectedPoints = [];
+
+        var ageSelect = d3.select("#ageSelect");
+        var regionSelect = d3.select("#regionSelect");
+        var sentimentButtons = d3.selectAll("button[data-sentiment]");
+
+        d3.csv("tsne_clusters.csv", d => {
+            let region = d.Region ? d.Region.trim() : "Unknown";
+            let usaStates = ["Alabama","Alaska","Arizona","Arkansas","California","Colorado","Connecticut","Delaware","Florida","Georgia",
+                             "Hawaii","Idaho","Illinois","Indiana","Iowa","Kansas","Kentucky","Louisiana","Maine","Maryland","Massachusetts",
+                             "Michigan","Minnesota","Mississippi","Missouri","Montana","Nebraska","Nevada","New Hampshire","New Jersey",
+                             "New Mexico","New York","North Carolina","North Dakota","Ohio","Oklahoma","Oregon","Pennsylvania","Rhode Island",
+                             "South Carolina","South Dakota","Tennessee","Texas","Utah","Vermont","Virginia","Washington","West Virginia",
+                             "Wisconsin","Wyoming"];
+            if (usaStates.includes(region)) region = "United States";
+
+            let ageGroup = "55+";
+            if (+d.Age < 25) ageGroup = "18-24";
+            else if (+d.Age < 35) ageGroup = "25-34";
+            else if (+d.Age < 45) ageGroup = "35-44";
+            else if (+d.Age < 55) ageGroup = "45-54";
+
+            return {
+                x: +d.TSNE1,
+                y: +d.TSNE2,
+                cluster: +d.Cluster,
+                engagement: +d["Engagement Rate"],
+                platform: d.Platform,
+                age: ageGroup,
+                gender: d.Gender,
+                sentiment: d.Sentiment.toLowerCase(),
+                region: region
+            };
+        }).then(data => {
+
+            var ageOrder = ["18-24", "25-34", "35-44", "45-54", "55+"];
+            var ages = Array.from(new Set(data.map(d => d.age))).sort((a,b) => ageOrder.indexOf(a) - ageOrder.indexOf(b));
+            var regions = Array.from(new Set(data.map(d => d.region))).sort((a,b)=>d3.ascending(a,b));
+
+            ageSelect.selectAll("option")
+                .data(["All"].concat(ages))
+                .enter().append("option")
+                .text(d => d);
+
+            regionSelect.selectAll("option")
+                .data(["All"].concat(regions))
+                .enter().append("option")
+                .text(d => d);
+
+            sentimentButtons.on("click", function() {
+                sentimentButtons.classed("active", false);
+                d3.select(this).classed("active", true);
+                update();
+            });
+
+            ageSelect.on("change", update);
+            regionSelect.on("change", update);
+
+            d3.select("#resetFilters").on("click", function() {
+                selectedPlatforms.clear();
+                selectedGender = null;
+                selectedPoints = [];
+
+                ageSelect.property("value", "All");
+                regionSelect.property("value", "All");
+
+                sentimentButtons.classed("active", false);
+                sentimentButtons.filter("[data-sentiment='all']").classed("active", true);
+
+                scatterSvg.selectAll(".brush").call(d3.brush().move, null);
+
+                update();
+            });
+
+            function update() {
+                var selectedAge = ageSelect.property("value");
+                var selectedRegion = regionSelect.property("value");
+                var selectedSentiment = sentimentButtons.filter(function() { return d3.select(this).classed("active"); }).attr("data-sentiment");
+
+                var filtered = data.filter(d => {
+                    var okAge = (selectedAge === "All" || d.age == selectedAge);
+                    var okSentiment = (selectedSentiment === "all" || d.sentiment === selectedSentiment);
+                    var okRegion = (selectedRegion === "All" || d.region === selectedRegion);
+                    var okGender = (selectedGender === null || d.gender == selectedGender);
+                    var okPlatform = (selectedPlatforms.size === 0 || selectedPlatforms.has(d.platform));
+                    return okAge && okSentiment && okRegion && okGender && okPlatform;
+                });
+
+                if (selectedPoints.length > 0) {
+                    filtered = filtered.filter(d => selectedPoints.includes(d));
+                }
+
+                drawScatter(filtered);
+                drawHistogram(filtered);
+                drawPlatformBar(filtered);
+                drawGenderBar(filtered);
+            }
+
+            function drawScatter(dataset) { 
+                scatterSvg.selectAll("*").remove();
+                legendContainer.selectAll("*").remove();
+
+                var xScale = d3.scaleLinear()
+                    .domain(d3.extent(dataset, d => d.x))
+                    .range([50, scatterWidth - 50]);
+                var yScale = d3.scaleLinear()
+                    .domain(d3.extent(dataset, d => d.y))
+                    .range([scatterHeight - 50, 50]);
+
+                var xAxis = scatterSvg.append("g")
+                    .attr("transform", "translate(0," + (scatterHeight - 50) + ")")
+                    .call(d3.axisBottom(xScale));
+                var yAxis = scatterSvg.append("g")
+                    .attr("transform", "translate(50,0)")
+                    .call(d3.axisLeft(yScale));
+
+                scatterSvg.append("text")
+                    .attr("x", scatterWidth / 2)
+                    .attr("y", 25)
+                    .attr("text-anchor", "middle")
+                    .style("font-size", "16px")
+                    .style("font-weight", "bold")
+                    .text("t-SNE Scatterplot");
+
+                var circles = scatterSvg.selectAll("circle")
+                    .data(dataset)
+                    .enter().append("circle")
+                    .attr("cx", d => xScale(d.x))
+                    .attr("cy", d => yScale(d.y))
+                    .attr("r", 3)
+                    .style("fill", d => colorScale(d.cluster))
+                    .style("opacity", 0.8);
+
+                var brush = d3.brush()
+                    .extent([[50, 50], [scatterWidth - 50, scatterHeight - 50]])
+                    .on("brush end", function(event) {
+                        var selection = event.selection;
+                        if (!selection) {
+                            selectedPoints = [];
+                            circles.classed("selected", false).style("opacity", 0.8);
+                            drawHistogram(dataset);
+                            drawPlatformBar(dataset);
+                            drawGenderBar(dataset);
+                            return;
+                        }
+
+                        var [[x0, y0], [x1, y1]] = selection;
+                        selectedPoints = dataset.filter(d => {
+                            var cx = xScale(d.x), cy = yScale(d.y);
+                            return x0 <= cx && cx <= x1 && y0 <= cy && cy <= y1;
+                        });
+
+                        circles.classed("selected", d => selectedPoints.includes(d))
+                            .style("opacity", d => selectedPoints.length === 0 || selectedPoints.includes(d) ? 1 : 0.2);
+
+                        drawHistogram(selectedPoints);
+                        drawPlatformBar(selectedPoints);
+                        drawGenderBar(selectedPoints);
+                    });
+
+                scatterSvg.append("g").attr("class", "brush").call(brush);
+
+                scatterSvg.on("dblclick", function() {
+                    selectedPoints = [];
+                    xScale.domain(d3.extent(dataset, d => d.x));
+                    yScale.domain(d3.extent(dataset, d => d.y));
+                    var t = scatterSvg.transition().duration(750);
+                    xAxis.transition(t).call(d3.axisBottom(xScale));
+                    yAxis.transition(t).call(d3.axisLeft(yScale));
+                    circles.transition(t)
+                        .attr("cx", d => xScale(d.x))
+                        .attr("cy", d => yScale(d.y));
+                    drawHistogram(dataset);
+                    drawPlatformBar(dataset);
+                    drawGenderBar(dataset);
+                });
+
+                colorScale.domain().forEach(cluster => {
+                    var item = legendContainer.append("div").attr("class", "legend-item");
+                    item.append("div").attr("class", "legend-color")
+                        .style("background", colorScale(cluster));
+                    item.append("span").text("Cluster " + cluster);
+                });
+            }
+
+
+            function drawHistogram(dataset) {
+                histSvg.selectAll("*").remove();
+                var bins = d3.bin()
+                    .value(d => d.engagement)
+                    .domain(d3.extent(dataset, d => d.engagement))
+                    .thresholds(20)(dataset);
+                var xScale = d3.scaleLinear()
+                    .domain(d3.extent(dataset, d => d.engagement))
+                    .range([50, histWidth - 50]);
+                var yScale = d3.scaleLinear()
+                    .domain([0, d3.max(bins, d => d.length)])
+                    .range([histHeight - 50, 50]);
+                histSvg.append("text")
+                    .attr("x", histWidth / 2)
+                    .attr("y", 25)
+                    .attr("text-anchor", "middle")
+                    .style("font-size", "16px")
+                    .style("font-weight", "bold")
+                    .text("Engagement Rate Histogram");
+                histSvg.append("g")
+                    .attr("transform", "translate(0," + (histHeight - 50) + ")")
+                    .call(d3.axisBottom(xScale));
+                histSvg.append("g")
+                    .attr("transform", "translate(50,0)")
+                    .call(d3.axisLeft(yScale));
+                histSvg.selectAll("rect")
+                    .data(bins)
+                    .enter().append("rect")
+                    .attr("x", d => xScale(d.x0))
+                    .attr("y", d => yScale(d.length))
+                    .attr("width", d => xScale(d.x1) - xScale(d.x0) - 1)
+                    .attr("height", d => histHeight - 50 - yScale(d.length))
+                    .attr("fill", "#1f77b4")
+                    .style("opacity", 0.7)
+                    .on("mouseover", (event, d) => {
+                        tooltip.style("opacity", 1)
+                            .html(`Frequency: ${d.length}<br>Range: ${d.x0.toFixed(1)} - ${d.x1.toFixed(1)}`);
+                    })
+                    .on("mousemove", (event) => {
+                        tooltip.style("left", (event.pageX + 10) + "px")
+                               .style("top", (event.pageY - 20) + "px");
+                    })
+                    .on("mouseout", () => tooltip.style("opacity", 0));
+            }
+
+            function drawPlatformBar(dataset) {
+                platformSvg.selectAll("*").remove();
+                var grouped = Array.from(d3.rollup(dataset, v => v.length, d => d.platform), ([key, value]) => ({ key, value }));
+                var allPlatforms = Array.from(new Set(data.map(d => d.platform)));
+                allPlatforms.forEach(p => { if (!grouped.find(g => g.key === p)) grouped.push({ key: p, value: 0 }); });
+                var xScale = d3.scaleBand().domain(allPlatforms).range([50, platformWidth - 50]).padding(0.3);
+                var yScale = d3.scaleLinear().domain([0, d3.max(grouped, d => d.value) || 1]).range([platformHeight - 50, 50]);
+                platformSvg.append("text").attr("x", platformWidth / 2).attr("y", 25).attr("text-anchor", "middle").style("font-size", "16px").style("font-weight", "bold").text("Posts by Platform");
+                platformSvg.append("g").attr("transform", "translate(0," + (platformHeight - 50) + ")").call(d3.axisBottom(xScale));
+                platformSvg.append("g").attr("transform", "translate(50,0)").call(d3.axisLeft(yScale));
+                platformSvg.selectAll(".bar").data(grouped).enter().append("rect")
+                    .attr("class", "bar")
+                    .attr("x", d => xScale(d.key))
+                    .attr("y", d => yScale(d.value))
+                    .attr("width", xScale.bandwidth())
+                    .attr("height", d => Math.max(1, platformHeight - 50 - yScale(d.value)))
+                    .attr("fill", "#ff7f0e")
+                    .style("opacity", d => selectedPlatforms.size === 0 || selectedPlatforms.has(d.key) ? 0.9 : 0.3)
+                    .on("click", (event, d) => { selectedPlatforms.has(d.key) ? selectedPlatforms.delete(d.key) : selectedPlatforms.add(d.key); update(); })
+                    .on("mouseover", (event, d) => { tooltip.style("opacity", 1).html(`${d.key}: ${d.value} posts`); })
+                    .on("mousemove", (event) => { tooltip.style("left", (event.pageX + 10) + "px").style("top", (event.pageY - 20) + "px"); })
+                    .on("mouseout", () => tooltip.style("opacity", 0));
+            }
+
+            function drawGenderBar(dataset) {
+                genderSvg.selectAll("*").remove();
+                var grouped = Array.from(d3.rollup(dataset, v => v.length, d => d.gender == 0 ? "Male" : "Female"), ([key, value]) => ({ key, value }));
+                var xScale = d3.scaleBand().domain(grouped.map(d => d.key)).range([50, genderWidth - 50]).padding(0.2);
+                var yScale = d3.scaleLinear().domain([0, d3.max(grouped, d => d.value)]).range([genderHeight - 50, 50]);
+                genderSvg.append("text").attr("x", genderWidth / 2).attr("y", 25).attr("text-anchor", "middle").style("font-size", "16px").style("font-weight", "bold").text("Posts by Gender");
+                genderSvg.append("g").attr("transform", "translate(0," + (genderHeight - 50) + ")").call(d3.axisBottom(xScale));
+                genderSvg.append("g").attr("transform", "translate(50,0)").call(d3.axisLeft(yScale));
+                genderSvg.selectAll(".bar").data(grouped).enter().append("rect")
+                    .attr("class", "bar")
+                    .attr("x", d => xScale(d.key))
+                    .attr("y", d => yScale(d.value))
+                    .attr("width", xScale.bandwidth())
+                    .attr("height", d => genderHeight - 50 - yScale(d.value))
+                    .attr("fill", "#1f77b4")
+                    .on("click", (event, d) => { selectedGender = (selectedGender == (d.key === "Male" ? 0 : 1)) ? null : (d.key === "Male" ? 0 : 1); update(); })
+                    .on("mouseover", (event, d) => { tooltip.style("opacity", 1).html(`${d.key}: ${d.value} posts`); })
+                    .on("mousemove", (event) => { tooltip.style("left", (event.pageX + 10) + "px").style("top", (event.pageY - 20) + "px"); })
+                    .on("mouseout", () => tooltip.style("opacity", 0));
+            }
+
+            update();
+        });
+    </script>
+</body>
+</html>
